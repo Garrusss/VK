@@ -2,41 +2,69 @@ import httpx
 import asyncio
 import random
 from fastapi import HTTPException, status
+import logging
+
+logger = logging.getLogger(__name__)
 
 VK_API_VERSION = "5.199" # Используйте актуальную версию
 VK_API_URL = "https://api.vk.com/method/"
 
 async def validate_vk_token(token: str) -> int | None:
-    """Проверяет токен VK и возвращает user_id, если валиден."""
-    async with httpx.AsyncClient() as client:
+    """
+    Проверяет токен VK, обращаясь к users.get.
+    Возвращает user_id, если токен валиден, иначе None.
+    """
+    if not token:
+        logger.warning("validate_vk_token called with empty token.")
+        return None
+
+    async with httpx.AsyncClient(timeout=10.0) as client:
         try:
+            logger.debug("Validating VK token...")
             response = await client.post(
                 f"{VK_API_URL}users.get",
                 params={"access_token": token, "v": VK_API_VERSION}
             )
-            response.raise_for_status()
+            response.raise_for_status() # Проверка на HTTP ошибки 4xx/5xx
             data = response.json()
-            if "response" in data and data["response"]:
-                return data["response"][0]["id"]
+            logger.debug(f"VK users.get response: {data}")
+
+            if "response" in data and data["response"] and isinstance(data["response"], list):
+                vk_user_id = data["response"][0].get("id")
+                if vk_user_id:
+                    logger.info(f"VK token validation successful for user_id: {vk_user_id}")
+                    return vk_user_id
+                else:
+                    logger.error("VK token validation error: 'id' not found in response.")
+                    return None
             elif "error" in data:
-                 print(f"VK API Error (validate_vk_token): {data['error']}")
+                 error_info = data['error']
+                 logger.error(f"VK API Error during token validation: {error_info.get('error_code')} - {error_info.get('error_msg')}")
                  return None
             else:
-                 print(f"Unknown VK API response (validate_vk_token): {data}")
+                 logger.error(f"Unknown VK API response structure during token validation: {data}")
                  return None
+        except httpx.TimeoutException:
+            logger.error("Timeout error validating VK token.")
+            return None
         except httpx.RequestError as e:
-            print(f"HTTP error validating VK token: {e}")
+            logger.error(f"HTTP error validating VK token: {e}", exc_info=True)
             return None
         except Exception as e:
-             print(f"Unexpected error validating VK token: {e}")
+             logger.error(f"Unexpected error validating VK token: {e}", exc_info=True)
              return None
 
 
-async def send_vk_message(token: str, recipient_id: str, message: str) -> tuple[bool, int | None, str | None]:
+async def send_vk_message(token: str, recipient_id: str, message: str, job_id: str | None = None) -> tuple[bool, int | None, str | None]:
     """
     Отправляет сообщение через VK API.
     Возвращает (success: bool, vk_message_id: int | None, error_message: str | None)
     """
+    log_prefix = f"[Job {job_id}] " if job_id else ""
+    if not token or not recipient_id or not message:
+        logger.error(f"{log_prefix}send_vk_message called with invalid parameters (empty token, recipient, or message).")
+        return False, None, "Internal error: Invalid parameters for sending message."
+
     # Генерируем random_id для идемпотентности VK API
     random_id = random.randint(0, 2**31 - 1)
     params = {
@@ -45,42 +73,49 @@ async def send_vk_message(token: str, recipient_id: str, message: str) -> tuple[
         "peer_id": recipient_id,
         "message": message,
         "random_id": random_id,
-        "dont_parse_links": 0 # или 1, если не нужно превью ссылок
+        "dont_parse_links": 0 # 0 - создавать превью ссылок
     }
-    async with httpx.AsyncClient(timeout=10.0) as client: # Увеличим таймаут
+    logger.info(f"{log_prefix}Attempting to send VK message to peer_id: {recipient_id} (random_id: {random_id})")
+
+    async with httpx.AsyncClient(timeout=15.0) as client: # Увеличим таймаут для отправки
         try:
-            print(f"Sending VK message to {recipient_id}...")
             response = await client.post(f"{VK_API_URL}messages.send", params=params)
-            # Логируем ответ VK API для отладки
-            print(f"VK messages.send response status: {response.status_code}, content: {response.text[:500]}")
+            # Логируем ответ VK API для отладки (первые 500 символов)
+            logger.debug(f"{log_prefix}VK messages.send response status: {response.status_code}, content: {response.text[:500]}")
 
             response.raise_for_status() # Вызовет исключение для 4xx/5xx
             data = response.json()
 
             if "response" in data:
+                # Ответ может быть числом (message_id) или объектом для бесед
                 message_id = data["response"]
-                print(f"VK message sent successfully to {recipient_id}, message_id: {message_id}")
-                return True, message_id, None
+                logger.info(f"{log_prefix}VK message sent successfully to peer_id: {recipient_id}. VK Response: {message_id}")
+                # Вернем сам message_id как число, если это возможно
+                numeric_message_id = message_id if isinstance(message_id, int) else None
+                return True, numeric_message_id, None
             elif "error" in data:
                 error_info = data["error"]
                 error_msg = error_info.get("error_msg", "Unknown VK error")
                 error_code = error_info.get("error_code", -1)
-                print(f"VK API Error (messages.send) for {recipient_id}: Code {error_code}, Msg: {error_msg}")
+                logger.error(f"{log_prefix}VK API Error (messages.send) for peer_id {recipient_id}: Code {error_code}, Msg: {error_msg}")
                 # Особо обрабатываем ошибки токена/авторизации
-                if error_code in [5, 7, 10, 15, 113]: # Auth failed, Invalid user, etc.
+                # Коды ошибок взяты из документации VK API: https://dev.vk.com/reference/errors
+                if error_code in [5, 7, 10, 15, 17, 113, 28]: # User authorization failed, permission denied, internal server error (captcha?), invalid user id, app needs confirmation
                     # Можно добавить логику инвалидации токена в БД здесь
+                    # Например, пометить аккаунт как требующий перепривязки
+                    logger.warning(f"{log_prefix}Authorization or permission error encountered (Code: {error_code}). Token might be invalid or require action.")
                     pass
                 return False, None, f"VK Error {error_code}: {error_msg}"
             else:
-                print(f"Unknown VK API response (messages.send) for {recipient_id}: {data}")
+                logger.error(f"{log_prefix}Unknown VK API response structure (messages.send) for peer_id {recipient_id}: {data}")
                 return False, None, "Unknown VK API response"
 
         except httpx.TimeoutException:
-             print(f"Timeout error sending VK message to {recipient_id}")
+             logger.error(f"{log_prefix}Timeout error sending VK message to peer_id {recipient_id}")
              return False, None, "Timeout sending message to VK"
         except httpx.RequestError as e:
-            print(f"HTTP error sending VK message to {recipient_id}: {e}")
+            logger.error(f"{log_prefix}HTTP error sending VK message to peer_id {recipient_id}: {e}", exc_info=True)
             return False, None, f"Network error: {e}"
         except Exception as e:
-            print(f"Unexpected error sending VK message to {recipient_id}: {e}")
+            logger.error(f"{log_prefix}Unexpected error sending VK message to peer_id {recipient_id}: {e}", exc_info=True)
             return False, None, f"Unexpected error: {e}"
