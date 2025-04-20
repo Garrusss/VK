@@ -6,7 +6,7 @@ from fastapi import Depends, HTTPException, status
 from fastapi.security import APIKeyHeader
 import sqlite3
 from contextlib import closing
-from .database import SYNC_DATABASE_PATH # Путь к БД
+from database import SYNC_DATABASE_PATH
 
 load_dotenv()
 
