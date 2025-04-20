@@ -4,9 +4,9 @@ from apscheduler.executors.asyncio import AsyncIOExecutor
 from pytz import utc
 import logging
 
-from .database import DATABASE_URL
-from .vk_api import send_vk_message
-from .security import get_decrypted_vk_token
+from database import DATABASE_URL
+from vk_api import send_vk_message
+from security import get_decrypted_vk_token
 
 logging.basicConfig()
 logging.getLogger('apscheduler').setLevel(logging.INFO) # Уровень логгирования планировщика
