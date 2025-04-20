@@ -6,7 +6,11 @@ from datetime import datetime, timezone
 import uuid
 import logging
 
-from . import database, security, vk_api, scheduler, models
+import database
+import security
+import vk_api
+import scheduler
+import models
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
